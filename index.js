@@ -14,7 +14,7 @@ const admin = require("firebase-admin");
 const serviceAccount = require("./zap-shift.json");
 
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
+    credential: admin.credential.cert(serviceAccount)
 });
 
 function generateTrackingId() {
@@ -31,12 +31,12 @@ function generateTrackingId() {
 app.use(express.json())
 app.use(cors())
 
-const verifyFBToken = async(req, res, next) => {
+const verifyFBToken = async (req, res, next) => {
     console.log('headers in the middleware', req.headers.authorization);
-    const token  = req.headers.authorization
+    const token = req.headers.authorization
 
-    if(!token) {
-        return res.status(401).send({message: 'unauthorized access'})
+    if (!token) {
+        return res.status(401).send({ message: 'unauthorized access' })
     }
 
     try {
@@ -44,9 +44,9 @@ const verifyFBToken = async(req, res, next) => {
         const decoded = await admin.auth().verifyIdToken(idToken)
         req.decoded_email = decoded.email
         console.log(decoded);
-        
+
     } catch (error) {
-        return res.status(401).send({message: 'unauthorized access'})
+        return res.status(401).send({ message: 'unauthorized access' })
     }
     next()
 }
@@ -73,18 +73,75 @@ const run = async () => {
         const paymentsCollections = db.collection('payments')
         const ridersCollections = db.collection('riders')
 
+        // middle admin before allowing admin activity
+        // must be used after verifyFBToken middleware
+        const verifyAdmin = async (req, res, next) => {
+            const email = req.decoded_email
+            const query = { email }
+            const user = await usersCollections.findOne(query)
+
+
+
+            if (!user || user.role !== 'admin') {
+                return res.status(403).send({ message: 'forbidden access' })
+            }
+
+            next()
+        }
+
+
         // user related api
-        app.post('/users', async(req,res) => {
+
+        app.get('/users', verifyFBToken, async (req, res) => {
+            const searchText = req.query.searchText
+            const query = {}
+            if (searchText) {
+                // query.displayName = {$regex: searchText, $options: 'i'}
+
+                query.$or = [
+                    {displayName : {$regex: searchText, $options: 'i'}},
+                    {email: {$regex: searchText, $options: 'i'}}
+                ]
+            }
+
+            const cursor = usersCollections.find(query).sort({ createAt: -1 }).limit(5)
+            const result = await cursor.toArray()
+            res.send(result)
+        })
+
+        
+
+        app.get('/users/:email/role', async (req, res) => {
+            const email = req.params.email
+            const query = { email }
+            const user = await usersCollections.findOne(query)
+            res.send({ role: user?.role || 'user' })
+        })
+
+        app.post('/users', async (req, res) => {
             const user = req.body
             user.role = 'user'
             user.createAt = new Date()
             const email = user.email
-            const userExist = await usersCollections.findOne({email})
-            if (userExist){
-                return res.send({message: 'user exist'})
+            const userExist = await usersCollections.findOne({ email })
+            if (userExist) {
+                return res.send({ message: 'user exist' })
             }
 
             const result = await usersCollections.insertOne(user)
+            res.send(result)
+        })
+
+        app.patch('/users/:id/role', verifyFBToken, verifyAdmin, async (req, res) => {
+            const id = req.params.id
+            const roleInfo = req.body
+            const query = { _id: new ObjectId(id) }
+            const updateDoc = {
+                $set: {
+                    role: roleInfo.role
+                }
+            }
+            const result = await usersCollections.updateOne(query, updateDoc)
             res.send(result)
         })
 
@@ -92,9 +149,13 @@ const run = async () => {
         app.get('/parcels', async (req, res) => {
             const query = {}
 
-            const { email } = req.query
+            const { email, deliveryStatus } = req.query
             if (email) {
                 query.senderEmail = email
+            }
+
+            if(deliveryStatus){
+                query.deliveryStatus = deliveryStatus
             }
 
             const options = { sort: { createAt: -1 } }
@@ -116,6 +177,36 @@ const run = async () => {
             parcel.createAt = new Date()
             const result = await parcelsCollections.insertOne(parcel)
             res.send(result)
+        })
+
+        app.patch('/parcels/:id', async(req,res) => {
+            const { riderId, riderName, riderEmail} = req.body
+            const id = req.params.id
+            const query = {_id: new ObjectId(id)}
+
+            const updateDoc ={
+                $set: {
+                    deliveryStatus: 'driver_assigned',
+                    riderId: riderId,
+                    riderName: riderName,
+                    riderEmail: riderEmail
+                }
+            }
+
+            const result = await parcelsCollections.updateOne(query, updateDoc)
+
+            // update rider information
+
+            const riderQuery = {_id: new ObjectId(riderId)}
+            const riderUpdateDoc = {
+                $set: {
+                    workStatus: 'in_delivery'
+                }
+            }
+
+            const riderResult = await ridersCollections.updateOne(riderQuery, riderUpdateDoc)
+
+            res.send(riderResult)
         })
 
         app.delete('/parcels/:id', async (req, res) => {
@@ -165,12 +256,12 @@ const run = async () => {
             const session = await stripe.checkout.sessions.retrieve(sessionId)
             // console.log("session retrieve", session);
             const transactionId = session.payment_intent;
-            const query = {transactionId: transactionId}
+            const query = { transactionId: transactionId }
 
             const paymentExist = await paymentsCollections.findOne(query)
             if (paymentExist) {
-                return res.send({ success: true, message: 'Payment already exist', transactionId, trackingId:paymentExist.trackingId})
-            } 
+                return res.send({ success: true, message: 'Payment already exist', transactionId, trackingId: paymentExist.trackingId })
+            }
 
             const trackingId = generateTrackingId()
 
@@ -180,6 +271,7 @@ const run = async () => {
                 const update = {
                     $set: {
                         paymentStatus: 'paid',
+                        deliveryStatus: 'pending-pickup',
                         trackingId: trackingId
                     }
                 }
@@ -216,31 +308,39 @@ const run = async () => {
         })
 
         // payment related api
-        app.get('/payments', verifyFBToken, async (req,res) => {
+        app.get('/payments', verifyFBToken, async (req, res) => {
             const email = req.query.email
             const query = {}
 
-            console.log("headers",req.headers);
-            
-            if(email){
+            console.log("headers", req.headers);
+
+            if (email) {
                 query.customerEmail = email
 
                 // check email address
-                if(email !== req.decoded_email){
-                    return res.status(403).send({message: 'forbidden access'})
+                if (email !== req.decoded_email) {
+                    return res.status(403).send({ message: 'forbidden access' })
                 }
             }
-            const cursor = paymentsCollections.find(query).sort({paidAt: -1})
+            const cursor = paymentsCollections.find(query).sort({ paidAt: -1 })
             const result = await cursor.toArray()
             res.send(result)
         })
 
         // raider api
 
-        app.get('/riders', async(req,res) => {
+        app.get('/riders', async (req, res) => {
+            const {status, district, workStatus} = req.query
             const query = {}
-            if(req.query.status){
-                query.status = req.query.status
+            if (status) {
+                query.status = status
+            }
+
+            if(district){
+                query.district = district
+            }
+            if(workStatus){
+                query.workStatus = workStatus
             }
             const cursor = ridersCollections.find(query)
             const result = await cursor.toArray()
@@ -250,29 +350,37 @@ const run = async () => {
         app.patch('/riders/:id', verifyFBToken, async (req, res) => {
             const status = req.body.status
             const id = req.params.id
-            const query = {_id: new ObjectId(id)}
+            const query = { _id: new ObjectId(id) }
             const updateDoc = {
-                $set : {
-                    status: status
+                $set: {
+                    status: status,
+                    workStatus: 'available'
                 }
             }
 
             const result = await ridersCollections.updateOne(query, updateDoc)
 
-            if(status === 'approved'){
-                
+            if (status === 'approved') {
+                const email = req.body.email
+                const useQuery = { email }
+                const updateUser = {
+                    $set: {
+                        role: 'rider'
+                    }
+                }
+                const userResult = await usersCollections.updateOne(useQuery, updateUser)
             }
             res.send(result)
         })
 
-        app.delete('/riders/:id', async(req,res) => {
+        app.delete('/riders/:id', async (req, res) => {
             const id = req.params.id
-            
-            const result = await ridersCollections.deleteOne({_id: new ObjectId(id)})
+
+            const result = await ridersCollections.deleteOne({ _id: new ObjectId(id) })
             res.send(result)
         })
 
-        app.post('/riders', async(req,res) => {
+        app.post('/riders', async (req, res) => {
             const rider = req.body
             rider.status = 'pending'
             rider.createdAt = new Date()
